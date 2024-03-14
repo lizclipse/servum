@@ -157,28 +157,22 @@ fn default_watch_enabled() -> bool {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub struct Shell<S = String>
-where
-    S: From<String>,
-{
+pub struct Shell<C = ShellPath> {
     /// The shell to use for tasks by default if set, optionally with args.
     /// Either a string or an array of strings can be given.
     ///
     /// Defaults to `/bin/sh`
     #[serde(default)]
-    pub cmd: ShellPath<S>,
+    pub cmd: C,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ShellPath<S = String> {
-    Single(S),
-    Multi(Vec<S>),
+pub enum ShellPath {
+    Single(String),
+    Multi(Vec<String>),
 }
 
-impl<S> Default for ShellPath<S>
-where
-    S: From<String>,
-{
+impl Default for ShellPath {
     fn default() -> Self {
         Self::Single("/bin/sh".to_owned().into())
     }
@@ -239,21 +233,76 @@ fn default_env_merge() -> bool {
 
 // ---------- Impls ----------
 
+type Rstr = Rc<String>;
+
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedTask {
     pub config: TaskConfig,
-    pub shell: Vec<Rc<String>>,
-    pub path: Path<Rc<String>>,
-    pub env: Env<Rc<String>>,
+    // TODO: validate that first value resolves to a valid file.
+    pub shell: Option<Vec<Rstr>>,
+    pub path: Path<Rstr>,
+    pub env: Env<Rstr>,
 }
 
 impl From<Config> for (Watch, Vec<ResolvedTask>) {
-    fn from(_value: Config) -> Self {
-        todo!()
+    fn from(
+        Config {
+            tasks,
+            watch,
+            shell,
+            path,
+            env,
+        }: Config,
+    ) -> Self {
+        let shell: Global<Shell<Vec<Rstr>>> = shell.map(|c| c.into());
+        let shell_path = shell.map(|s| s.cmd);
+        let path: Global<Path<Rstr>> = path.map(|c| c.into());
+        let env: Global<Env<Rstr>> = env.map(|c| c.into());
+
+        let tasks = tasks
+            .into_iter()
+            .map(|task| ResolvedTask {
+                config: task.config,
+                shell: task
+                    .shell
+                    .map_custom(|s| s.into())
+                    .resolve(&shell_path)
+                    .and_then(|s| if s.is_empty() { None } else { Some(s) }),
+                path: task
+                    .path
+                    .map_custom(|p| p.map(|p| p.into()).resolve(&path.config))
+                    .resolve(&path)
+                    .unwrap_or_default(),
+                env: task
+                    .env
+                    .map_custom(|e| e.map(|e| e.into()).resolve(&env.config))
+                    .resolve(&env)
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        (watch, tasks)
     }
 }
 
-impl From<ShellPath> for Vec<Rc<String>> {
+impl<T> Global<T> {
+    pub fn map<O>(self, f: impl FnOnce(T) -> O) -> Global<O> {
+        Global {
+            use_by_default: self.use_by_default,
+            config: f(self.config),
+        }
+    }
+}
+
+impl From<Shell<ShellPath>> for Shell<Vec<Rstr>> {
+    fn from(value: Shell<ShellPath>) -> Self {
+        Self {
+            cmd: value.cmd.into(),
+        }
+    }
+}
+
+impl From<ShellPath> for Vec<Rstr> {
     fn from(value: ShellPath) -> Self {
         match value {
             ShellPath::Single(v) => vec![Rc::new(v)],
@@ -263,10 +312,10 @@ impl From<ShellPath> for Vec<Rc<String>> {
 }
 
 pub trait Mergeable {
-    fn merge(&self, other: &Self) -> Self;
+    fn merge(self, other: Self) -> Self;
 }
 
-impl From<Path<String>> for Path<Rc<String>> {
+impl From<Path<String>> for Path<Rstr> {
     fn from(value: Path<String>) -> Self {
         Self {
             dirs: value.dirs.into_iter().map(Rc::new).collect(),
@@ -275,13 +324,17 @@ impl From<Path<String>> for Path<Rc<String>> {
     }
 }
 
-impl Mergeable for Path<Rc<String>> {
-    fn merge(&self, _other: &Self) -> Self {
-        todo!()
+impl Mergeable for Path<Rstr> {
+    fn merge(mut self, mut other: Self) -> Self {
+        other.dirs.append(&mut self.dirs);
+        Self {
+            dirs: other.dirs,
+            apply: other.apply,
+        }
     }
 }
 
-impl From<Env<String>> for Env<Rc<String>> {
+impl From<Env<String>> for Env<Rstr> {
     fn from(value: Env<String>) -> Self {
         Self {
             vars: value
@@ -294,15 +347,62 @@ impl From<Env<String>> for Env<Rc<String>> {
     }
 }
 
-impl Mergeable for Env<Rc<String>> {
-    fn merge(&self, _other: &Self) -> Self {
-        todo!()
+impl Mergeable for Env<Rstr> {
+    fn merge(mut self, other: Self) -> Self {
+        self.vars.extend(other.vars.into_iter());
+        Self {
+            vars: self.vars,
+            merge: other.merge,
+        }
     }
 }
 
-impl<T> Overridable<T> {}
+impl<T> Overridable<T>
+where
+    T: Clone,
+{
+    pub fn resolve(self, global: &Global<T>) -> Option<T> {
+        match self {
+            Self::Unset if global.use_by_default => Some(global.config.clone()),
+            Self::Use(true) => Some(global.config.clone()),
+            Self::Unset | Self::Use(false) => None,
+            Self::Custom(v) => Some(v),
+        }
+    }
+}
 
-impl<T> Inheritable<T> where T: Mergeable {}
+impl<T> Overridable<T> {
+    pub fn map_custom<O>(self, f: impl FnOnce(T) -> O) -> Overridable<O> {
+        match self {
+            Self::Unset => Overridable::Unset,
+            Self::Use(u) => Overridable::Use(u),
+            Self::Custom(v) => Overridable::Custom(f(v)),
+        }
+    }
+}
+
+impl<T> Inheritable<T>
+where
+    T: Mergeable + Clone,
+{
+    pub fn resolve(self, global: &T) -> T {
+        if self.inherit {
+            let global = global.clone();
+            global.merge(self.config)
+        } else {
+            self.config
+        }
+    }
+}
+
+impl<T> Inheritable<T> {
+    pub fn map<O>(self, f: impl FnOnce(T) -> O) -> Inheritable<O> {
+        Inheritable {
+            inherit: self.inherit,
+            config: f(self.config),
+        }
+    }
+}
 
 impl FromStr for Config {
     type Err = toml::de::Error;
