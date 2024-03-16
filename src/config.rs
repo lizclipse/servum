@@ -7,8 +7,8 @@ use color_eyre::eyre;
 use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
 pub struct Config {
     /// Task definitions.
     #[serde(default, rename = "task")]
@@ -19,31 +19,75 @@ pub struct Config {
 }
 
 #[allow(clippy::module_name_repetitions)]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
 pub struct TaskConfig {
     /// An optional nice name for the task.
     pub name: Option<String>,
     /// A cron string defining when this task should be run.
+    ///
+    /// If the command is currently running, then it will not be run again.
     pub cron: Option<String>,
     /// The command to run, along with arguments.
     ///
     /// If `shell` is enabled for this task, then this command
     /// will be run with it.
-    #[serde(default)]
     pub cmd: Option<MultiStr>,
+    /// The command to use to stop the running process.
+    /// This is used for tasks that are intended to be long running
+    /// and have a dedicated way to be shut-down.
+    ///
+    /// If not set, a SIGINT will be attempted to be sent on *nix platforms.
+    /// The process will then be killed if any of the following are true:
+    ///
+    /// - The process does not shutdown within the specified timeout
+    /// - The current system is Windows
+    /// - The command specified returns a non-zero exit-code
+    pub cmd_stop: Option<MultiStr>,
+    /// The time (in milliseconds) to wait for the process to stop gracefully.
+    /// If set to 0, then:
+    ///
+    /// - If `cmd_stop` is set, then it will be executed and not waited on
+    /// - If not set, then the process will be killed straight away without SIGINT
+    ///   being sent first.
+    ///
+    /// Defaults to 10 seconds (10_000).
+    pub stop_timeout: usize,
     /// If enabled, then this task will be run when the process first
     /// starts.
     ///
-    /// This is mostly useful for when this service is configured to start
-    /// at boot, since it would allow the task to be run on boot.
+    /// This is mostly useful for if a task should be run immediately
+    /// or in the background.
     ///
     /// Defaults to `false`.
     pub on_start: bool,
+    /// Whether the task is enabled.
+    /// This is mainly to allow a task to be disabled or stopped without stopping
+    /// the main scheduler or removing the task entirely.
+    ///
+    /// If this task currently has a running process, then it will
+    /// be stopped according to the _current_ version of the config.
+    ///
+    /// Defaults to `true`.
+    pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+impl Default for TaskConfig {
+    fn default() -> Self {
+        Self {
+            name: None,
+            cron: None,
+            cmd: None,
+            cmd_stop: None,
+            stop_timeout: 10_000,
+            on_start: false,
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
 pub struct Task {
     /// Task(s) to extend from.
     pub extends: Option<MultiStr>,
@@ -52,19 +96,16 @@ pub struct Task {
     pub config: TaskConfig,
     /// The shell to use for this task.
     /// Can be set to `false` to unset (only applies when extending a task).
-    #[serde(default)]
     pub shell: Overridable<MultiStr>,
     /// A custom PATH env var for this task.
     /// Can be set to `false` to unset (only applies when extending a task).
-    #[serde(default)]
     pub path: Overridable<Inheritable<Path>>,
     /// A custom env vars for this task.
     /// Can be set to `false` to unset (only applies when extending a task).
-    #[serde(default)]
     pub env: Overridable<Inheritable<Env>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Overridable<T> {
     #[default]
@@ -73,21 +114,20 @@ pub enum Overridable<T> {
     Custom(T),
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
 pub struct Inheritable<T> {
     /// Whether to replace this option entirely instead of merging.
     ///
     /// Defaults to `false`.
-    #[serde(default)]
     pub replace: bool,
     /// The config option.
-    #[serde(flatten, default)]
+    #[serde(flatten)]
     pub config: T,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
 pub struct Watch {
     /// Whether the config file should be watched and reloaded upon changes.
     ///
@@ -95,38 +135,39 @@ pub struct Watch {
     /// to pick up any further changes.
     ///
     /// Defaults to `true`
-    #[serde(default = "Watch::default_enabled")]
     pub enabled: bool,
     /// Whether to force the usage of the fallback poll-watcher. Mostly as an
     /// escape hatch if the default doesn't work for some reason.
-    #[serde(default)]
     pub force_poll: bool,
 }
 
-impl Watch {
-    const fn default_enabled() -> bool {
-        true
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            force_poll: false,
+        }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A simple wrapper to allow either `"single string"` or `["multiple", "strings"]`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum MultiStr {
     Single(String),
     Multi(Vec<String>),
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
 pub struct Path<S = String> {
     /// The directories to include in the PATH env var.
-    #[serde(default)]
     pub dirs: Vec<S>,
     /// How to apply the set directories to the PATH env var.
-    #[serde(default)]
     pub apply: PathApplyMethod,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PathApplyMethod {
     /// Prefixes the given directories to the PATH env var.
@@ -140,8 +181,8 @@ pub enum PathApplyMethod {
     Overwrite,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
 pub struct Env<S = String>
 where
     S: Hash + Eq,
@@ -154,25 +195,28 @@ where
     /// by the `path` config (i.e. it will not have an affect).
     /// If the `path` config has not been set, then the variable will
     /// be passed through as normal. or maybe it'll be merged fuck knows
-    #[serde(default)]
     pub vars: HashMap<S, S>,
     /// If enabled, then the env vars given here will be merged in with
     /// the ones given to this process.
     ///
     /// Defaults to `true`.
-    #[serde(default = "default_env_merge")]
     pub merge: bool,
 }
 
-fn default_env_merge() -> bool {
-    true
+impl Default for Env {
+    fn default() -> Self {
+        Self {
+            vars: HashMap::default(),
+            merge: true,
+        }
+    }
 }
 
 // ---------- Impls ----------
 
 type Rstr = Rc<String>;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedTask {
     pub config: TaskConfig,
     // TODO: validate that first value resolves to a valid file.

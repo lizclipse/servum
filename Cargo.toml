@@ -17,4 +17,4 @@ serde = { version = "1.0.197", features = ["derive"] }
 toml = "0.8.11"
 
 [dev-dependencies]
-map-macro = "0.3.0"
+map-macro = { version = "0.3.0", features = ["hashbrown"] }
