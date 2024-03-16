@@ -1,8 +1,10 @@
 #[cfg(test)]
 mod test;
 
-use std::{collections::HashMap, hash::Hash, rc::Rc, str::FromStr};
+use std::{hash::Hash, rc::Rc, str::FromStr};
 
+use color_eyre::eyre;
+use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -10,57 +12,13 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// Task definitions.
     #[serde(default, rename = "task")]
-    pub tasks: Vec<Task>,
+    pub tasks: HashMap<String, Task>,
     /// Config watcher config.
     #[serde(default)]
     pub watch: Watch,
-    /// Shell config options.
-    ///
-    /// Tasks do not use this by default - instead, they are
-    /// executed directly unless explicitly set otherwise.
-    #[serde(default)]
-    pub shell: Global<Shell>,
-    /// Path config.
-    ///
-    /// Tasks will use this by default, but it will default to the
-    /// value of the PATH env var.
-    #[serde(default = "Global::default_enabled")]
-    pub path: Global<Path>,
-    /// Env Config.
-    ///
-    /// Tasks will use this by default, but it will default to the
-    /// env vars given to the process.
-    #[serde(default = "Global::default_enabled")]
-    pub env: Global<Env>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct Global<T> {
-    /// Whether this global config will be used by tasks by default.
-    /// Tasks can individually choose to use or not use the global
-    /// settings, and (for some options) can extend them.
-    ///
-    /// The default for this is per-option.
-    #[serde(default)]
-    pub use_by_default: bool,
-    /// The config option.
-    #[serde(flatten, default)]
-    pub config: T,
-}
-
-impl<T> Global<T>
-where
-    T: Default,
-{
-    fn default_enabled() -> Self {
-        Self {
-            use_by_default: true,
-            ..Default::default()
-        }
-    }
-}
-
+#[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct TaskConfig {
@@ -73,7 +31,7 @@ pub struct TaskConfig {
     /// If `shell` is enabled for this task, then this command
     /// will be run with it.
     #[serde(default)]
-    pub cmd: Vec<String>,
+    pub cmd: Option<MultiStr>,
     /// If enabled, then this task will be run when the process first
     /// starts.
     ///
@@ -87,27 +45,21 @@ pub struct TaskConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Task {
+    /// Task(s) to extend from.
+    pub extends: Option<MultiStr>,
     /// Base config for the task.
     #[serde(flatten)]
     pub config: TaskConfig,
     /// The shell to use for this task.
-    ///
-    /// Can be a bool to use the globally-configured one or not,
-    /// or set to a string/string-array to use a custom one.
-    ///
-    /// Defaults to the global config.
+    /// Can be set to `false` to unset (only applies when extending a task).
     #[serde(default)]
-    pub shell: Overridable<ShellPath>,
+    pub shell: Overridable<MultiStr>,
     /// A custom PATH env var for this task.
-    ///
-    /// Can be a bool to use the globally-configured one or not,
-    /// or set to a custom value.
+    /// Can be set to `false` to unset (only applies when extending a task).
     #[serde(default)]
     pub path: Overridable<Inheritable<Path>>,
     /// A custom env vars for this task.
-    ///
-    /// Can be a bool to use the globally-configured ones or not,
-    /// or set to a custom value.
+    /// Can be set to `false` to unset (only applies when extending a task).
     #[serde(default)]
     pub env: Overridable<Inheritable<Env>>,
 }
@@ -124,11 +76,11 @@ pub enum Overridable<T> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Inheritable<T> {
-    /// Whether to inerit the global config and extend it.
+    /// Whether to replace this option entirely instead of merging.
     ///
     /// Defaults to `false`.
     #[serde(default)]
-    pub inherit: bool,
+    pub replace: bool,
     /// The config option.
     #[serde(flatten, default)]
     pub config: T,
@@ -143,7 +95,7 @@ pub struct Watch {
     /// to pick up any further changes.
     ///
     /// Defaults to `true`
-    #[serde(default = "default_watch_enabled")]
+    #[serde(default = "Watch::default_enabled")]
     pub enabled: bool,
     /// Whether to force the usage of the fallback poll-watcher. Mostly as an
     /// escape hatch if the default doesn't work for some reason.
@@ -151,31 +103,16 @@ pub struct Watch {
     pub force_poll: bool,
 }
 
-fn default_watch_enabled() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct Shell<C = ShellPath> {
-    /// The shell to use for tasks by default if set, optionally with args.
-    /// Either a string or an array of strings can be given.
-    ///
-    /// Defaults to `/bin/sh`
-    #[serde(default)]
-    pub cmd: C,
+impl Watch {
+    const fn default_enabled() -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ShellPath {
+pub enum MultiStr {
     Single(String),
     Multi(Vec<String>),
-}
-
-impl Default for ShellPath {
-    fn default() -> Self {
-        Self::Single("/bin/sh".to_owned().into())
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -240,73 +177,170 @@ pub struct ResolvedTask {
     pub config: TaskConfig,
     // TODO: validate that first value resolves to a valid file.
     pub shell: Option<Vec<Rstr>>,
-    pub path: Path<Rstr>,
-    pub env: Env<Rstr>,
+    pub path: Option<Path<Rstr>>,
+    pub env: Option<Env<Rstr>>,
 }
 
-impl From<Config> for (Watch, Vec<ResolvedTask>) {
-    fn from(
-        Config {
-            tasks,
-            watch,
-            shell,
-            path,
-            env,
-        }: Config,
-    ) -> Self {
-        let shell: Global<Shell<Vec<Rstr>>> = shell.map(|c| c.into());
-        let shell_path = shell.map(|s| s.cmd);
-        let path: Global<Path<Rstr>> = path.map(|c| c.into());
-        let env: Global<Env<Rstr>> = env.map(|c| c.into());
+impl TryFrom<Config> for (Watch, HashMap<String, ResolvedTask>) {
+    type Error = eyre::Error;
 
-        let tasks = tasks
-            .into_iter()
-            .map(|task| ResolvedTask {
-                config: task.config,
-                shell: task
-                    .shell
-                    .map_custom(|s| s.into())
-                    .resolve(&shell_path)
-                    .and_then(|s| if s.is_empty() { None } else { Some(s) }),
-                path: task
-                    .path
-                    .map_custom(|p| p.map(|p| p.into()).resolve(&path.config))
-                    .resolve(&path)
-                    .unwrap_or_default(),
-                env: task
-                    .env
-                    .map_custom(|e| e.map(|e| e.into()).resolve(&env.config))
-                    .resolve(&env)
-                    .unwrap_or_default(),
+    fn try_from(Config { mut tasks, watch }: Config) -> Result<Self, Self::Error> {
+        // Check that all tasks extend from known tasks.
+        for task in tasks.values() {
+            let Some(extends) = &task.extends else {
+                continue;
+            };
+
+            match extends {
+                MultiStr::Single(e) => {
+                    if tasks.get(e).is_none() {
+                        eyre::bail!("Unknown task `{}`", e);
+                    }
+                }
+                MultiStr::Multi(es) => {
+                    for e in es {
+                        if tasks.get(e).is_none() {
+                            eyre::bail!("Unknown task `{}`", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut resolved: HashMap<_, _> = tasks
+            .extract_if(|_k, v| v.extends.is_empty())
+            .map(|(k, task)| {
+                (
+                    k,
+                    ResolvedTask {
+                        config: task.config,
+                        shell: task
+                            .shell
+                            .map_custom(std::convert::Into::into)
+                            .resolve(None),
+                        path: task
+                            .path
+                            .map_custom(|p| p.map(std::convert::Into::into).resolve(None))
+                            .resolve(None),
+                        env: task
+                            .env
+                            .map_custom(|e| e.map(std::convert::Into::into).resolve(None))
+                            .resolve(None),
+                    },
+                )
             })
             .collect();
 
-        (watch, tasks)
+        while !tasks.is_empty() {
+            let start_len = tasks.len();
+            let mut next = HashMap::new();
+
+            for (id, task) in tasks {
+                match resolve_task(task, &resolved) {
+                    Ok(task) => {
+                        resolved.insert(id, task);
+                    }
+                    Err(task) => {
+                        next.insert(id, task);
+                    }
+                }
+            }
+
+            if next.len() == start_len {
+                eyre::bail!("Extends dependency cycle detected");
+            }
+
+            tasks = next;
+        }
+
+        Ok((watch, resolved))
     }
 }
 
-impl<T> Global<T> {
-    pub fn map<O>(self, f: impl FnOnce(T) -> O) -> Global<O> {
-        Global {
-            use_by_default: self.use_by_default,
-            config: f(self.config),
+#[allow(clippy::result_large_err)]
+fn resolve_task(
+    task: Task,
+    resolved: &HashMap<String, ResolvedTask>,
+) -> Result<ResolvedTask, Task> {
+    let mut parents = vec![];
+
+    match &task.extends {
+        Some(MultiStr::Single(e)) => match resolved.get(e) {
+            Some(p) => parents.push(p),
+            None => return Err(task),
+        },
+        Some(MultiStr::Multi(es)) => {
+            for e in es {
+                match resolved.get(e) {
+                    Some(p) => parents.push(p),
+                    None => return Err(task),
+                }
+            }
+        }
+        _ => (),
+    }
+
+    #[allow(clippy::type_complexity)]
+    let (shell, path, env): (Option<Vec<Rstr>>, Option<Path<Rstr>>, Option<Env<Rstr>>) = parents
+        .into_iter()
+        .fold((None, None, None), |(shell, path, env), p| {
+            (
+                match (shell, &p.shell) {
+                    (Some(shell), None) => Some(shell),
+                    (_, Some(shell)) => Some(shell.clone()),
+                    _ => None,
+                },
+                match (path, &p.path) {
+                    (Some(path), Some(p_path)) => Some(path.merge(p_path.clone())),
+                    (Some(path), None) => Some(path),
+                    (None, Some(path)) => Some(path.clone()),
+                    _ => None,
+                },
+                match (env, &p.env) {
+                    (Some(env), Some(p_env)) => Some(env.merge(p_env.clone())),
+                    (Some(env), None) => Some(env),
+                    (None, Some(env)) => Some(env.clone()),
+                    _ => None,
+                },
+            )
+        });
+
+    Ok(ResolvedTask {
+        config: task.config,
+        shell: task
+            .shell
+            .map_custom(std::convert::Into::into)
+            .resolve(shell.as_ref()),
+        path: task
+            .path
+            .map_custom(|p| p.map(std::convert::Into::into).resolve(path.as_ref()))
+            .resolve(path.as_ref()),
+        env: task
+            .env
+            .map_custom(|e| e.map(std::convert::Into::into).resolve(env.as_ref()))
+            .resolve(env.as_ref()),
+    })
+}
+
+trait IsEmpty {
+    fn is_empty(&self) -> bool;
+}
+
+impl IsEmpty for Option<MultiStr> {
+    fn is_empty(&self) -> bool {
+        match self {
+            None => true,
+            Some(MultiStr::Multi(v)) if v.is_empty() => true,
+            _ => false,
         }
     }
 }
 
-impl From<Shell<ShellPath>> for Shell<Vec<Rstr>> {
-    fn from(value: Shell<ShellPath>) -> Self {
-        Self {
-            cmd: value.cmd.into(),
-        }
-    }
-}
-
-impl From<ShellPath> for Vec<Rstr> {
-    fn from(value: ShellPath) -> Self {
+impl From<MultiStr> for Vec<Rstr> {
+    fn from(value: MultiStr) -> Self {
         match value {
-            ShellPath::Single(v) => vec![Rc::new(v)],
-            ShellPath::Multi(vs) => vs.into_iter().map(Rc::new).collect(),
+            MultiStr::Single(v) => vec![Rc::new(v)],
+            MultiStr::Multi(vs) => vs.into_iter().map(Rc::new).collect(),
         }
     }
 }
@@ -349,7 +383,7 @@ impl From<Env<String>> for Env<Rstr> {
 
 impl Mergeable for Env<Rstr> {
     fn merge(mut self, other: Self) -> Self {
-        self.vars.extend(other.vars.into_iter());
+        self.vars.extend(other.vars);
         Self {
             vars: self.vars,
             merge: other.merge,
@@ -361,12 +395,11 @@ impl<T> Overridable<T>
 where
     T: Clone,
 {
-    pub fn resolve(self, global: &Global<T>) -> Option<T> {
-        match self {
-            Self::Unset if global.use_by_default => Some(global.config.clone()),
-            Self::Use(true) => Some(global.config.clone()),
-            Self::Unset | Self::Use(false) => None,
-            Self::Custom(v) => Some(v),
+    pub fn resolve(self, parent: Option<&T>) -> Option<T> {
+        match (self, parent) {
+            (Self::Use(true), Some(parent)) => Some(parent.clone()),
+            (Self::Custom(v), _) => Some(v),
+            _ => None,
         }
     }
 }
@@ -385,12 +418,13 @@ impl<T> Inheritable<T>
 where
     T: Mergeable + Clone,
 {
-    pub fn resolve(self, global: &T) -> T {
-        if self.inherit {
-            let global = global.clone();
-            global.merge(self.config)
-        } else {
-            self.config
+    pub fn resolve(self, parent: Option<&T>) -> T {
+        match (self.replace, parent) {
+            (false, Some(parent)) => {
+                let parent = parent.clone();
+                parent.merge(self.config)
+            }
+            _ => self.config,
         }
     }
 }
@@ -398,7 +432,7 @@ where
 impl<T> Inheritable<T> {
     pub fn map<O>(self, f: impl FnOnce(T) -> O) -> Inheritable<O> {
         Inheritable {
-            inherit: self.inherit,
+            replace: self.replace,
             config: f(self.config),
         }
     }

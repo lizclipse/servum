@@ -8,8 +8,13 @@ edition = "2021"
 [dependencies]
 chrono = "0.4.35"
 clap = { version = "4.5.2", features = ["derive", "cargo"] }
+color-eyre = "0.6.3"
 cron = "0.12.1"
 futures = "0.3.30"
+hashbrown = { version = "0.14.3", features = ["serde"] }
 notify = "6.1.1"
 serde = { version = "1.0.197", features = ["derive"] }
 toml = "0.8.11"
+
+[dev-dependencies]
+map-macro = "0.3.0"
