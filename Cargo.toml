@@ -18,3 +18,4 @@ toml = "0.8.11"
 
 [dev-dependencies]
 map-macro = { version = "0.3.0", features = ["hashbrown"] }
+pretty_assertions = "1.4.0"

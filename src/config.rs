@@ -203,7 +203,10 @@ where
     pub merge: bool,
 }
 
-impl Default for Env {
+impl<S> Default for Env<S>
+where
+    S: Hash + Eq,
+{
     fn default() -> Self {
         Self {
             vars: HashMap::default(),
@@ -253,26 +256,7 @@ impl TryFrom<Config> for (Watch, HashMap<String, ResolvedTask>) {
 
         let mut resolved: HashMap<_, _> = tasks
             .extract_if(|_k, v| v.extends.is_empty())
-            .map(|(k, task)| {
-                (
-                    k,
-                    ResolvedTask {
-                        config: task.config,
-                        shell: task
-                            .shell
-                            .map_custom(std::convert::Into::into)
-                            .resolve(None),
-                        path: task
-                            .path
-                            .map_custom(|p| p.map(std::convert::Into::into).resolve(None))
-                            .resolve(None),
-                        env: task
-                            .env
-                            .map_custom(|e| e.map(std::convert::Into::into).resolve(None))
-                            .resolve(None),
-                    },
-                )
-            })
+            .map(|(k, task)| (k, task.into()))
             .collect();
 
         while !tasks.is_empty() {
@@ -351,19 +335,33 @@ fn resolve_task(
 
     Ok(ResolvedTask {
         config: task.config,
-        shell: task
-            .shell
-            .map_custom(std::convert::Into::into)
-            .resolve(shell.as_ref()),
+        shell: task.shell.map_custom(Into::into).resolve(shell.as_ref()),
         path: task
             .path
-            .map_custom(|p| p.map(std::convert::Into::into).resolve(path.as_ref()))
+            .map_custom(|p| p.map(Into::into).resolve(path.as_ref()))
             .resolve(path.as_ref()),
         env: task
             .env
-            .map_custom(|e| e.map(std::convert::Into::into).resolve(env.as_ref()))
+            .map_custom(|e| e.map(Into::into).resolve(env.as_ref()))
             .resolve(env.as_ref()),
     })
+}
+
+impl From<Task> for ResolvedTask {
+    fn from(task: Task) -> Self {
+        ResolvedTask {
+            config: task.config,
+            shell: task.shell.map_custom(Into::into).resolve(None),
+            path: task
+                .path
+                .map_custom(|p| p.map(Into::into).resolve(None))
+                .resolve(None),
+            env: task
+                .env
+                .map_custom(|e| e.map(Into::into).resolve(None))
+                .resolve(None),
+        }
+    }
 }
 
 trait IsEmpty {
@@ -405,6 +403,7 @@ impl From<Path<String>> for Path<Rstr> {
 impl Mergeable for Path<Rstr> {
     fn merge(mut self, mut other: Self) -> Self {
         other.dirs.append(&mut self.dirs);
+        other.dirs.dedup();
         Self {
             dirs: other.dirs,
             apply: other.apply,
@@ -441,7 +440,7 @@ where
 {
     pub fn resolve(self, parent: Option<&T>) -> Option<T> {
         match (self, parent) {
-            (Self::Use(true), Some(parent)) => Some(parent.clone()),
+            (Self::Use(true), Some(parent)) | (Self::Unset, Some(parent)) => Some(parent.clone()),
             (Self::Custom(v), _) => Some(v),
             _ => None,
         }
