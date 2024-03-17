@@ -256,11 +256,11 @@ fn test_resolve_complex() {
         BAR_ENV = 'overridden bar env'
         BAZ_ENV = 'additional env'
 
-        [task.baz]
-        extends = ['foo', 'bar']
-
         [task.baz.path]
         dirs = ['/usr/bin']
+
+        [task.qoz]
+        extends = ['bar', 'baz']
     "
     .parse::<Config>()
     .unwrap()
@@ -310,9 +310,14 @@ fn test_resolve_complex() {
         },
 
         "baz".to_owned() => ResolvedTask {
-            config: TaskConfig {
+            path: Some(Path {
+                dirs: vec![rstr("/usr/bin")],
                 ..Default::default()
-            },
+            }),
+            ..Default::default()
+        },
+
+        "qoz".to_owned() => ResolvedTask {
             shell: Some(vec![rstr("/bin/bash")]),
             path: Some(Path {
                 dirs: vec![rstr("/usr/bin"), rstr("/bin")],
